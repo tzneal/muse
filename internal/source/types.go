@@ -1,0 +1,34 @@
+package source
+
+import (
+	"encoding/json"
+	"time"
+)
+
+// Session is the normalized representation of a conversation from any agent.
+type Session struct {
+	SchemaVersion int       `json:"schema_version"`
+	Source        string    `json:"source"`
+	SessionID     string    `json:"session_id"`
+	Project       string    `json:"project"`
+	Title         string    `json:"title"`
+	CreatedAt     time.Time `json:"created_at"`
+	UpdatedAt     time.Time `json:"updated_at"`
+	ParentID      string    `json:"parent_id,omitempty"`
+	SubagentIDs   []string  `json:"subagent_ids,omitempty"`
+	Messages      []Message `json:"messages"`
+}
+
+type Message struct {
+	Role      string     `json:"role"`
+	Content   string     `json:"content"`
+	Timestamp time.Time  `json:"timestamp"`
+	Model     string     `json:"model,omitempty"`
+	ToolCalls []ToolCall `json:"tool_calls,omitempty"`
+}
+
+type ToolCall struct {
+	Name   string          `json:"name"`
+	Input  json.RawMessage `json:"input,omitempty"`
+	Output json.RawMessage `json:"output,omitempty"`
+}
