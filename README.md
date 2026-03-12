@@ -5,14 +5,17 @@ them into skills, and serves those skills to any agent that asks.
 
 ## How it works
 
-**Upload** pulls memories from local agent databases on your machine (OpenCode, Claude Code, Kiro,
-etc.) and syncs them to storage. Your shade learns from these memories by dreaming.
+**Push** pulls memories from local agent databases on your machine (OpenCode, Claude Code, Kiro,
+etc.) and pushes them to storage. Your shade learns from these memories by dreaming.
 
 **Dream** reads your uploaded memories, focusing on the feedback you give to models: where they get
-things wrong, what you correct, what you reinforce. It compresses these patterns into skills that
-capture your expertise. Skills are guidance, not information: they teach models how you want things
-done without leaking underlying data. Dreaming is lossy by design, keeping what matters and
-forgetting what doesn't.
+things wrong, what you correct, what you reinforce. It reflects on each memory individually, then
+compresses the reflections into skills that capture your expertise. Skills are guidance, not
+information: they teach models how you want things done without leaking underlying data. Dreaming is
+lossy by design, keeping what matters and forgetting what doesn't.
+
+Reflections are persisted so you can re-synthesize skills later with better models or prompts
+(`dream --learn`) without re-processing all your memories.
 
 **Listen** starts an MCP server that exposes a single tool: **ask**. An agent sends a question and
 gets back guidance shaped by your skills. Each call is stateless, a one-shot interaction with no
@@ -35,9 +38,10 @@ says so.
 export SHADE_BUCKET=$USER-shade
 export SHADE_MODEL=claude-sonnet-4-20250514
 
-shade upload    # sync memories to storage
-shade dream     # distill skills from memories
-shade listen    # start the MCP server
+shade push              # push memories to storage
+shade dream             # distill skills from memories
+shade dream --learn     # re-synthesize skills from existing reflections
+shade listen            # start the MCP server
 ```
 
 ## Install
@@ -60,7 +64,7 @@ server to your agent's MCP config:
 }
 ```
 
-For other operations like uploading memories or inspecting skills, use the shade CLI directly.
+For other operations like pushing memories or inspecting skills, use the shade CLI directly.
 
 The MCP server can also be deployed as a hosted remote server so your shade is available to agents
 running anywhere.
@@ -70,7 +74,7 @@ running anywhere.
 S3-compatible storage with the following layout:
 
 ```
-skills/{name}/SKILL.md      # distilled skills (https://agentskills.io)
-memories/{source}/{id}.json # human session history
-dream/state.json            # tracks which memories have been dreamed about
+skills/{name}/SKILL.md               # distilled skills (https://agentskills.io)
+memories/{source}/{id}.json          # human session history
+dream/reflections/{source}/{id}.md   # per-memory reflections
 ```

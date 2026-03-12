@@ -8,10 +8,10 @@ import (
 	"github.com/ellistarn/shade/internal/shade"
 )
 
-func newUploadCmd() *cobra.Command {
+func newPushCmd() *cobra.Command {
 	return &cobra.Command{
-		Use:   "upload",
-		Short: "Sync memories to storage",
+		Use:   "push",
+		Short: "Push memories to storage",
 		RunE: func(cmd *cobra.Command, args []string) error {
 			if err := requireBucket(); err != nil {
 				return err
@@ -29,7 +29,11 @@ func newUploadCmd() *cobra.Command {
 				fmt.Fprintf(cmd.ErrOrStderr(), "warning: %s\n", w)
 			}
 			fmt.Fprintf(cmd.OutOrStdout(), "Found %d local sessions\n", result.Total)
-			fmt.Fprintf(cmd.OutOrStdout(), "Uploaded %d sessions (%d unchanged, %s transferred)\n", result.Uploaded, result.Skipped, shade.FormatBytes(result.Bytes))
+			if result.Uploaded > 0 {
+				fmt.Fprintf(cmd.OutOrStdout(), "Uploaded %d sessions (%s), %d unchanged\n", result.Uploaded, shade.FormatBytes(result.Bytes), result.Skipped)
+			} else {
+				fmt.Fprintf(cmd.OutOrStdout(), "All %d sessions unchanged\n", result.Skipped)
+			}
 			return nil
 		},
 	}

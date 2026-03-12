@@ -2,7 +2,6 @@ package shade
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 	"strings"
 
@@ -186,26 +185,21 @@ func (s *Shade) Upload(ctx context.Context) (*UploadResult, error) {
 	for i := range local {
 		sess := &local[i]
 		key := fmt.Sprintf("memories/%s/%s.json", sess.Source, sess.SessionID)
-		data, err := json.Marshal(sess)
-		if err != nil {
-			warnings = append(warnings, fmt.Sprintf("failed to marshal %s: %v", sess.SessionID, err))
-			continue
-		}
-		size := len(data)
 		if entry, exists := remote[key]; exists {
 			if !sess.UpdatedAt.After(entry.LastModified) {
-				log.Printf("  skip %s (%s, unchanged)\n", key, FormatBytes(size))
+				log.Printf("  skip (unchanged) %s\n", key)
 				skipped++
 				continue
 			}
 		}
-		if err := s.storage.PutSession(ctx, sess); err != nil {
+		n, err := s.storage.PutSession(ctx, sess)
+		if err != nil {
 			warnings = append(warnings, fmt.Sprintf("failed to upload %s: %v", sess.SessionID, err))
 			continue
 		}
-		log.Printf("  upload %s (%s)\n", key, FormatBytes(size))
+		log.Printf("  upload (%s) %s\n", FormatBytes(n), key)
 		uploaded++
-		totalBytes += size
+		totalBytes += n
 	}
 	return &UploadResult{
 		Total:    len(local),
