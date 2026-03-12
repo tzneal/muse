@@ -74,9 +74,18 @@ func lookupPricing(model string) modelPricing {
 	return modelPricing{}
 }
 
+// Runtime is the subset of the Bedrock SDK used by Client.
+// This is the mock boundary for tests.
+type Runtime interface {
+	Converse(ctx context.Context, params *bedrockruntime.ConverseInput, optFns ...func(*bedrockruntime.Options)) (*bedrockruntime.ConverseOutput, error)
+}
+
+// ToolHandler resolves a tool call by name and input, returning the result text.
+type ToolHandler func(name string, input map[string]any) (string, error)
+
 // Client wraps Bedrock's Converse API with rate limiting and retry.
 type Client struct {
-	runtime  *bedrockruntime.Client
+	runtime  Runtime
 	model    string
 	pricing  modelPricing
 	throttle chan struct{} // token bucket: one token per request slot
@@ -109,6 +118,22 @@ func NewClient(ctx context.Context) (*Client, error) {
 	return c, nil
 }
 
+// NewClientWithRuntime creates a Client with a caller-provided Runtime.
+// Used in tests to inject a mock Bedrock backend. The token bucket is
+// pre-filled so tests don't block, and no background goroutine is started.
+func NewClientWithRuntime(_ context.Context, runtime Runtime) *Client {
+	// Large buffer so tests never block on rate limiting.
+	throttle := make(chan struct{}, 100)
+	for range 100 {
+		throttle <- struct{}{}
+	}
+	return &Client{
+		runtime:  runtime,
+		model:    "test-model",
+		throttle: throttle,
+	}
+}
+
 // refillTokens adds request tokens at a steady rate.
 func (c *Client) refillTokens(ctx context.Context) {
 	ticker := time.NewTicker(time.Second / time.Duration(requestsPerSec))
@@ -129,63 +154,168 @@ func (c *Client) refillTokens(ctx context.Context) {
 // Converse sends a message with a system prompt and returns the text response.
 // Requests are paced by a token bucket and retried with exponential backoff on throttling errors.
 func (c *Client) Converse(ctx context.Context, system, user string) (string, Usage, error) {
+	messages := []types.Message{
+		{
+			Role:    types.ConversationRoleUser,
+			Content: []types.ContentBlock{&types.ContentBlockMemberText{Value: user}},
+		},
+	}
+	text, usage, _, _, err := c.converseRaw(ctx, system, messages, nil)
+	return text, usage, err
+}
+
+const maxToolRounds = 3
+
+// ConverseWithTools sends a message and handles tool use in a loop.
+// The LLM can request tools up to maxToolRounds times. Once the tool loop
+// completes, a final call with synthesisPrompt (without tools) produces the
+// user-facing answer. This keeps intermediate reasoning and tool calls internal.
+func (c *Client) ConverseWithTools(ctx context.Context, system, user string, toolConfig *types.ToolConfiguration, handler ToolHandler, synthesisPrompt string) (string, Usage, error) {
+	messages := []types.Message{
+		{
+			Role:    types.ConversationRoleUser,
+			Content: []types.ContentBlock{&types.ContentBlockMemberText{Value: user}},
+		},
+	}
+
+	var totalUsage Usage
+	for range maxToolRounds {
+		_, usage, stop, assistantContent, err := c.converseRaw(ctx, system, messages, toolConfig)
+		totalUsage = totalUsage.Add(usage)
+		if err != nil {
+			return "", totalUsage, err
+		}
+		// Append the assistant's response (text or tool calls) to the conversation
+		messages = append(messages, types.Message{
+			Role:    types.ConversationRoleAssistant,
+			Content: assistantContent,
+		})
+		if stop != types.StopReasonToolUse {
+			break
+		}
+		toolResults := resolveToolCalls(assistantContent, handler)
+		messages = append(messages, types.Message{
+			Role:    types.ConversationRoleUser,
+			Content: toolResults,
+		})
+	}
+	// Synthesize: one final call without tools to produce the user-facing answer.
+	messages = append(messages, types.Message{
+		Role:    types.ConversationRoleUser,
+		Content: []types.ContentBlock{&types.ContentBlockMemberText{Value: synthesisPrompt}},
+	})
+	text, usage, _, _, err := c.converseRaw(ctx, system, messages, nil)
+	return text, totalUsage.Add(usage), err
+}
+
+func resolveToolCalls(content []types.ContentBlock, handler ToolHandler) []types.ContentBlock {
+	var results []types.ContentBlock
+	for _, block := range content {
+		tu, ok := block.(*types.ContentBlockMemberToolUse)
+		if !ok {
+			continue
+		}
+		var input map[string]any
+		if tu.Value.Input != nil {
+			if err := tu.Value.Input.UnmarshalSmithyDocument(&input); err != nil {
+				input = map[string]any{}
+			}
+		}
+		result, err := handler(aws.ToString(tu.Value.Name), input)
+		if err != nil {
+			results = append(results, &types.ContentBlockMemberToolResult{
+				Value: types.ToolResultBlock{
+					ToolUseId: tu.Value.ToolUseId,
+					Status:    types.ToolResultStatusError,
+					Content:   []types.ToolResultContentBlock{&types.ToolResultContentBlockMemberText{Value: err.Error()}},
+				},
+			})
+			continue
+		}
+		results = append(results, &types.ContentBlockMemberToolResult{
+			Value: types.ToolResultBlock{
+				ToolUseId: tu.Value.ToolUseId,
+				Status:    types.ToolResultStatusSuccess,
+				Content:   []types.ToolResultContentBlock{&types.ToolResultContentBlockMemberText{Value: result}},
+			},
+		})
+	}
+	return results
+}
+
+func (c *Client) converseRaw(ctx context.Context, system string, messages []types.Message, toolConfig *types.ToolConfiguration) (string, Usage, types.StopReason, []types.ContentBlock, error) {
 	var lastErr error
 	for attempt := range maxRetries {
 		// Wait for a request token (rate limiting)
 		select {
 		case <-ctx.Done():
-			return "", Usage{}, ctx.Err()
+			return "", Usage{}, "", nil, ctx.Err()
 		case <-c.throttle:
 		}
 
-		text, usage, err := c.converse(ctx, system, user)
+		text, usage, stop, content, err := c.converseRawOnce(ctx, system, messages, toolConfig)
 		if err == nil {
-			return text, usage, nil
+			return text, usage, stop, content, nil
 		}
 		if !isThrottling(err) {
-			return "", usage, err
+			return text, usage, stop, content, err
 		}
 		lastErr = err
 		backoff := backoffDuration(attempt)
 		log.Printf("  throttled (attempt %d/%d), backing off %s\n", attempt+1, maxRetries, backoff.Round(time.Millisecond))
 		select {
 		case <-ctx.Done():
-			return "", Usage{}, ctx.Err()
+			return "", Usage{}, "", nil, ctx.Err()
 		case <-time.After(backoff):
 		}
 	}
-	return "", Usage{}, fmt.Errorf("throttled after %d retries: %w", maxRetries, lastErr)
+	return "", Usage{}, "", nil, fmt.Errorf("throttled after %d retries: %w", maxRetries, lastErr)
 }
 
-func (c *Client) converse(ctx context.Context, system, user string) (string, Usage, error) {
-	out, err := c.runtime.Converse(ctx, &bedrockruntime.ConverseInput{
+func (c *Client) converseRawOnce(ctx context.Context, system string, messages []types.Message, toolConfig *types.ToolConfiguration) (string, Usage, types.StopReason, []types.ContentBlock, error) {
+	input := &bedrockruntime.ConverseInput{
 		ModelId: &c.model,
 		System: []types.SystemContentBlock{
 			&types.SystemContentBlockMemberText{Value: system},
 		},
-		Messages: []types.Message{
-			{
-				Role: types.ConversationRoleUser,
-				Content: []types.ContentBlock{
-					&types.ContentBlockMemberText{Value: user},
-				},
-			},
-		},
+		Messages: messages,
 		InferenceConfig: &types.InferenceConfiguration{
 			MaxTokens: aws.Int32(64000),
 		},
-		// Adaptive thinking for Opus 4.6: lets Claude decide when and how much to think.
-		// https://docs.aws.amazon.com/bedrock/latest/userguide/claude-messages-adaptive-thinking.html
 		AdditionalModelRequestFields: document.NewLazyDocument(map[string]any{
 			"thinking": map[string]any{
 				"type":   "adaptive",
 				"effort": "medium",
 			},
 		}),
-	})
-	if err != nil {
-		return "", Usage{}, fmt.Errorf("converse failed: %w", err)
 	}
+	if toolConfig != nil {
+		input.ToolConfig = toolConfig
+	}
+
+	out, err := c.runtime.Converse(ctx, input)
+	if err != nil {
+		return "", Usage{}, "", nil, fmt.Errorf("converse failed: %w", err)
+	}
+	usage := c.extractUsage(out)
+	msg, ok := out.Output.(*types.ConverseOutputMemberMessage)
+	if !ok {
+		return "", usage, out.StopReason, nil, nil
+	}
+	text := ""
+	for _, block := range msg.Value.Content {
+		if tb, ok := block.(*types.ContentBlockMemberText); ok {
+			text = tb.Value
+			break
+		}
+	}
+	if out.StopReason == types.StopReasonMaxTokens {
+		return text, usage, out.StopReason, msg.Value.Content, fmt.Errorf("response truncated: hit max token limit (%d output tokens)", usage.OutputTokens)
+	}
+	return text, usage, out.StopReason, msg.Value.Content, nil
+}
+
+func (c *Client) extractUsage(out *bedrockruntime.ConverseOutput) Usage {
 	var usage Usage
 	if out.Usage != nil {
 		if out.Usage.InputTokens != nil {
@@ -197,11 +327,7 @@ func (c *Client) converse(ctx context.Context, system, user string) (string, Usa
 	}
 	usage.inputPricePerToken = c.pricing.inputPerToken
 	usage.outputPricePerToken = c.pricing.outputPerToken
-	text := extractText(out)
-	if out.StopReason == types.StopReasonMaxTokens {
-		return text, usage, fmt.Errorf("response truncated: hit max token limit (%d output tokens)", usage.OutputTokens)
-	}
-	return text, usage, nil
+	return usage
 }
 
 // isThrottling checks whether the error is a Bedrock throttling (429) response.
@@ -224,17 +350,4 @@ func backoffDuration(attempt int) time.Duration {
 	// Add jitter: 50-100% of calculated backoff
 	jitter := 0.5 + rand.Float64()*0.5
 	return time.Duration(backoff * jitter)
-}
-
-func extractText(out *bedrockruntime.ConverseOutput) string {
-	msg, ok := out.Output.(*types.ConverseOutputMemberMessage)
-	if !ok {
-		return ""
-	}
-	for _, block := range msg.Value.Content {
-		if tb, ok := block.(*types.ContentBlockMemberText); ok {
-			return tb.Value
-		}
-	}
-	return ""
 }
