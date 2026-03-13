@@ -1,8 +1,8 @@
 # Muse
 
-A muse is the distilled essence of how you think. It absorbs your memories from agent interactions,
-distills them into a soul document ([soul.md](https://soul.md)), and embodies your unique thought
-processes when asked questions.
+A muse absorbs memories from your conversations, distills them into a soul
+document (soul.md), and embodies your unique thought processes when asked
+questions.
 
 ## Install
 
@@ -13,9 +13,8 @@ go install github.com/ellistarn/muse/cmd/muse@latest
 ## Getting Started
 
 ```bash
-muse load              # load memories into storage
-muse dream             # distill your soul from memories
-muse inspect           # see what your muse learned
+muse dream             # discover memories and distill soul.md
+muse soul              # print soul.md
 ```
 
 Wire up the MCP server so agents can ask your muse questions:
@@ -30,6 +29,14 @@ Wire up the MCP server so agents can ask your muse questions:
   }
 }
 ```
+
+## Sources
+
+Memories are automatically discovered from:
+
+- **Claude Code** — `~/.claude/projects/`
+- **Kiro** — `~/Library/Application Support/Kiro/User/globalStorage/kiro.kiroagent/workspace-sessions/`
+- **OpenCode** — `~/.local/share/opencode/opencode.db`
 
 ## Storage
 
