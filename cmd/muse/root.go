@@ -16,19 +16,19 @@ func newRootCmd() *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "muse",
 		Short: "The distilled essence of how you think",
-		Long: `A muse absorbs your memories from agent interactions, distills them into a
-soul document, and embodies your unique thought processes when asked questions.
+		Long: `A muse absorbs your memories from agent interactions, distills them into
+muse.md, and embodies your unique thought processes when asked questions.
 
 Workflow:
 
-  1. muse dream      Discover memories, reflect, and distill a soul document
-  2. muse soul       Print the soul document
+  1. muse dream      Discover memories, reflect, and distill muse.md
+  2. muse show       Print muse.md
   3. muse ask        Ask your muse a question (stateless, one-shot)
   4. muse listen     Start an MCP server so agents can ask your muse
 
 Getting started:
 
-  muse dream && muse soul
+  muse dream && muse show
 
 Data is stored locally at ~/.muse/ by default. Set MUSE_BUCKET to use S3 instead.
 
@@ -38,7 +38,7 @@ Run "muse listen --help" for MCP server configuration.`,
 	}
 	cmd.PersistentFlags().StringVar(&bucket, "bucket", os.Getenv("MUSE_BUCKET"), "S3 bucket name (or set MUSE_BUCKET)")
 	cmd.AddCommand(newDreamCmd())
-	cmd.AddCommand(newSoulCmd())
+	cmd.AddCommand(newShowCmd())
 	cmd.AddCommand(newListenCmd())
 	cmd.AddCommand(newAskCmd())
 	cmd.AddCommand(newSyncCmd())
