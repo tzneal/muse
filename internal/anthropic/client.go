@@ -9,6 +9,7 @@ import (
 	"github.com/anthropics/anthropic-sdk-go/option"
 
 	"github.com/ellistarn/muse/internal/inference"
+	"github.com/ellistarn/muse/internal/throttle"
 )
 
 // Model family constants matching bedrock's naming.
@@ -26,17 +27,26 @@ var pricingTable = map[string]modelPricing{
 	"opus":   {InputPerToken: 5.0 / 1_000_000, OutputPerToken: 25.0 / 1_000_000},
 }
 
-// Client wraps the Anthropic Messages API.
+// Anthropic Tier 4 rate limits: 4000 RPM ≈ 66 req/s
+const (
+	anthropicSeedRate = 60.0
+	anthropicMaxRate  = 66.0
+)
+
+// Client wraps the Anthropic Messages API with adaptive rate limiting.
+// Rate limiting: applied via throttle.Retry around each API call. The Anthropic
+// SDK lacks typed error responses, so throttle detection uses string matching.
 type Client struct {
 	client  anthropic.Client
 	model   string
 	family  string // "opus" or "sonnet", for pricing lookup
 	pricing modelPricing
+	limiter throttle.Limiter
 }
 
-// NewClient creates an Anthropic API client. Reads ANTHROPIC_API_KEY from env
-// by default. model should be "opus" or "sonnet".
-func NewClient(model string, opts ...option.RequestOption) (*Client, error) {
+// NewClient creates an Anthropic API client with adaptive rate limiting.
+// Reads ANTHROPIC_API_KEY from env by default. model should be "opus" or "sonnet".
+func NewClient(ctx context.Context, model string, opts ...option.RequestOption) (*Client, error) {
 	sdk := anthropic.NewClient(opts...)
 	resolved, family := resolveModel(model)
 	p := pricingTable[family]
@@ -45,6 +55,11 @@ func NewClient(model string, opts ...option.RequestOption) (*Client, error) {
 		model:   resolved,
 		family:  family,
 		pricing: p,
+		limiter: throttle.NewAIMDLimiter(ctx, throttle.Config{
+			SeedRate: anthropicSeedRate,
+			MaxRate:  anthropicMaxRate,
+			Label:    "anthropic",
+		}),
 	}, nil
 }
 
@@ -68,65 +83,84 @@ func (c *Client) ConverseMessages(ctx context.Context, system string, messages [
 	o := inference.Apply(opts)
 	params := c.buildParams(system, messages, o)
 
-	msg, err := c.client.Messages.New(ctx, params)
-	if err != nil {
-		return nil, fmt.Errorf("anthropic messages.new: %w", err)
-	}
+	var result *inference.Response
+	err := throttle.Retry(ctx, c.limiter, throttle.DefaultRetryConfig(), isThrottled, func() error {
+		msg, err := c.client.Messages.New(ctx, params)
+		if err != nil {
+			return fmt.Errorf("anthropic messages.new: %w", err)
+		}
 
-	text := extractText(msg)
-	usage := c.extractUsage(msg)
+		text := extractText(msg)
+		usage := c.extractUsage(msg)
+		result = &inference.Response{Text: text, Usage: usage}
 
-	if msg.StopReason == anthropic.StopReasonMaxTokens {
-		return &inference.Response{Text: text, Usage: usage},
-			fmt.Errorf("response truncated: hit max token limit (%d output tokens)", usage.OutputTokens)
-	}
-
-	return &inference.Response{Text: text, Usage: usage}, nil
+		if msg.StopReason == anthropic.StopReasonMaxTokens {
+			return fmt.Errorf("response truncated: hit max token limit (%d output tokens)", usage.OutputTokens)
+		}
+		return nil
+	})
+	return result, err
 }
 
+// NOTE: Retry wraps the entire stream. If a throttle error occurs mid-stream
+// after fn has already received partial deltas, the retry will re-deliver from
+// the beginning. This is acceptable for interactive/terminal use (the compose
+// pipeline uses ConverseMessages, not streaming). Do not use this in batch
+// pipelines without buffering or idempotent delivery.
 func (c *Client) ConverseMessagesStream(ctx context.Context, system string, messages []inference.Message, fn inference.StreamFunc, opts ...inference.ConverseOption) (*inference.Response, error) {
 	o := inference.Apply(opts)
 	params := c.buildParams(system, messages, o)
 
-	stream := c.client.Messages.NewStreaming(ctx, params)
+	var result *inference.Response
+	err := throttle.Retry(ctx, c.limiter, throttle.DefaultRetryConfig(), isThrottled, func() error {
+		stream := c.client.Messages.NewStreaming(ctx, params)
 
-	var text strings.Builder
-	var usage inference.Usage
-	accumulated := anthropic.Message{}
+		var text strings.Builder
+		var usage inference.Usage
+		accumulated := anthropic.Message{}
 
-	for stream.Next() {
-		event := stream.Current()
-		accumulated.Accumulate(event)
+		for stream.Next() {
+			event := stream.Current()
+			accumulated.Accumulate(event)
 
-		switch ev := event.AsAny().(type) {
-		case anthropic.ContentBlockDeltaEvent:
-			switch delta := ev.Delta.AsAny().(type) {
-			case anthropic.TextDelta:
-				text.WriteString(delta.Text)
-				if fn != nil {
-					fn(inference.StreamDelta{Text: delta.Text})
-				}
-			case anthropic.ThinkingDelta:
-				if fn != nil {
-					fn(inference.StreamDelta{Text: delta.Thinking, Thinking: true})
+			switch ev := event.AsAny().(type) {
+			case anthropic.ContentBlockDeltaEvent:
+				switch delta := ev.Delta.AsAny().(type) {
+				case anthropic.TextDelta:
+					text.WriteString(delta.Text)
+					if fn != nil {
+						fn(inference.StreamDelta{Text: delta.Text})
+					}
+				case anthropic.ThinkingDelta:
+					if fn != nil {
+						fn(inference.StreamDelta{Text: delta.Thinking, Thinking: true})
+					}
 				}
 			}
 		}
-	}
 
-	if err := stream.Err(); err != nil {
-		return nil, fmt.Errorf("anthropic stream: %w", err)
-	}
+		if err := stream.Err(); err != nil {
+			return fmt.Errorf("anthropic stream: %w", err)
+		}
 
-	usage = c.extractUsage(&accumulated)
-	fullText := text.String()
+		usage = c.extractUsage(&accumulated)
+		fullText := text.String()
+		result = &inference.Response{Text: fullText, Usage: usage}
 
-	if accumulated.StopReason == anthropic.StopReasonMaxTokens {
-		return &inference.Response{Text: fullText, Usage: usage},
-			fmt.Errorf("response truncated: hit max token limit (%d output tokens)", usage.OutputTokens)
-	}
+		if accumulated.StopReason == anthropic.StopReasonMaxTokens {
+			return fmt.Errorf("response truncated: hit max token limit (%d output tokens)", usage.OutputTokens)
+		}
+		return nil
+	})
+	return result, err
+}
 
-	return &inference.Response{Text: fullText, Usage: usage}, nil
+// isThrottled checks if an Anthropic SDK error is a rate limit (HTTP 429).
+// The Anthropic Go SDK does not expose a typed error with status code, so we
+// fall back to string matching. This is fragile but sufficient — the SDK
+// includes the HTTP status in the error message.
+func isThrottled(err error) bool {
+	return strings.Contains(err.Error(), "429") || strings.Contains(err.Error(), "rate_limit")
 }
 
 func (c *Client) buildParams(system string, messages []inference.Message, opts inference.ConverseOptions) anthropic.MessageNewParams {
