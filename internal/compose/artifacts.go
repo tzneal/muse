@@ -9,11 +9,14 @@ import (
 	"github.com/ellistarn/muse/internal/storage"
 )
 
-// Artifact path conventions. Each strategy builds paths under "compose/" using
-// the Store's generic PutData/GetData/ListData/DeleteData methods.
+// Artifact path conventions. Observations are shared across all strategies and
+// stored at the top level. Strategy-specific derived artifacts live under
+// "compose/". All paths use the Store's generic PutData/GetData/ListData methods.
 //
-// Clustering artifacts:
-//   compose/observations/{source}/{conversationID}.json
+// Shared:
+//   observations/{source}/{conversationID}.json
+//
+// Clustering-specific:
 //   compose/labels/{source}/{conversationID}.json
 //   compose/normalization.json
 
@@ -23,21 +26,26 @@ type SourceConversation struct {
 	ConversationID string
 }
 
-// composePath returns the key for a compose artifact.
+// composePath returns the key for a compose-specific (strategy-derived) artifact.
 func composePath(kind, source, conversationID string) string {
 	return fmt.Sprintf("compose/%s/%s/%s.json", kind, source, conversationID)
 }
 
+// observationPath returns the key for a shared observation artifact.
+func observationPath(source, conversationID string) string {
+	return fmt.Sprintf("observations/%s/%s.json", source, conversationID)
+}
+
 // PutObservations writes observations for a conversation.
 func PutObservations(ctx context.Context, store storage.Store, source, conversationID string, obs *Observations) error {
-	return putJSON(ctx, store, composePath("observations", source, conversationID), obs)
+	return putJSON(ctx, store, observationPath(source, conversationID), obs)
 }
 
 // GetObservations reads observations for a conversation.
 // Returns storage.NotFoundError when no artifact exists.
 func GetObservations(ctx context.Context, store storage.Store, source, conversationID string) (*Observations, error) {
 	var obs Observations
-	if err := getJSON(ctx, store, composePath("observations", source, conversationID), &obs); err != nil {
+	if err := getJSON(ctx, store, observationPath(source, conversationID), &obs); err != nil {
 		return nil, err
 	}
 	return &obs, nil
@@ -73,7 +81,7 @@ func GetNormalization(ctx context.Context, store storage.Store) (*Normalization,
 
 // ListObservations returns all (source, conversationID) pairs that have observations.
 func ListObservations(ctx context.Context, store storage.Store) ([]SourceConversation, error) {
-	return listArtifacts(ctx, store, "compose/observations/")
+	return listArtifacts(ctx, store, "observations/")
 }
 
 // ListLabels returns all (source, conversationID) pairs that have labels.
@@ -83,12 +91,12 @@ func ListLabels(ctx context.Context, store storage.Store) ([]SourceConversation,
 
 // DeleteObservations removes all observation artifacts.
 func DeleteObservations(ctx context.Context, store storage.Store) error {
-	return store.DeletePrefix(ctx, "compose/observations/")
+	return store.DeletePrefix(ctx, "observations/")
 }
 
 // DeleteObservationsForSource removes observation artifacts for a specific source.
 func DeleteObservationsForSource(ctx context.Context, store storage.Store, source string) error {
-	return store.DeletePrefix(ctx, fmt.Sprintf("compose/observations/%s/", source))
+	return store.DeletePrefix(ctx, fmt.Sprintf("observations/%s/", source))
 }
 
 // DeleteLabels removes all label artifacts.
