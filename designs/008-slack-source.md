@@ -60,7 +60,7 @@ human-to-human conversations; the AI extract prompt captures only reasoning and 
 
 For Slack, `extractTurns` accepts 1 user turn (instead of the default 2 for AI conversations).
 A thread where the owner makes one substantive point and three peers respond is valid signal —
-the owner's single statement reveals reasoning and voice.
+the owner's single statement reveals reasoning, awareness, and voice.
 
 ## User display names
 
@@ -166,7 +166,7 @@ information density.
 
 In AI conversations, 2+ user turns means the user corrected or refined something — that's where
 preferences emerge. In peer conversations, even a single substantive statement reveals reasoning
-and voice. 43% of Slack conversations had only 1 owner message — dropping them would lose nearly
+awareness, and voice. 43% of Slack conversations had only 1 owner message — dropping them would lose nearly
 half the signal.
 
 ### Why `user`/`assistant` roles instead of a new peer role?
